@@ -8,6 +8,7 @@ import sys
 from io import BytesIO
 from http import HTTPStatus
 from websocket import create_connection
+from websocket._exceptions import WebSocketConnectionClosedException
 from PIL import Image
 
 from loguru import logger
@@ -23,6 +24,7 @@ import src.utils as utils
 class PlaceClient:
     def __init__(self, config_path):
         self.logger = logger
+
         # Data
         self.json_data = utils.get_json_data(self, config_path)
         self.pixel_x_start: int = self.json_data["image_start_coords"][0]
@@ -40,6 +42,13 @@ class PlaceClient:
             if "unverified_place_frequency" in self.json_data
             and self.json_data["unverified_place_frequency"] is not None
             else False
+        )
+
+        self.legacy_transparency = (
+            self.json_data["legacy_transparency"]
+            if "legacy_transparency" in self.json_data
+            and self.json_data["legacy_transparency"] is not None
+            else True
         )
         proxy.Init(self)
 
@@ -69,14 +78,22 @@ class PlaceClient:
     # Draw a pixel at an x, y coordinate in r/place with a specific color
 
     def set_pixel_and_check_ratelimit(
-        self, access_token_in, x, y, color_index_in=18, canvas_index=0, thread_index=-1
+        self,
+        access_token_in,
+        x,
+        y,
+        name,
+        color_index_in=18,
+        canvas_index=0,
+        thread_index=-1,
     ):
         # canvas structure:
         # 0 | 1
         # 2 | 3
-        logger.info(
-            "Thread #{} : Attempting to place {} pixel at {}, {}",
+        logger.warning(
+            "Thread #{} - {}: Attempting to place {} pixel at {}, {}",
             thread_index,
+            name,
             ColorMapper.color_id_to_name(color_index_in),
             x + (1000 * (canvas_index % 2)),
             y + (1000 * (canvas_index // 2)),
@@ -109,9 +126,15 @@ class PlaceClient:
         }
 
         response = requests.request(
-            "POST", url, headers=headers, data=payload, proxies=proxy.get_random_proxy()
+            "POST",
+            url,
+            headers=headers,
+            data=payload,
+            proxies=proxy.get_random_proxy(self, name=None),
         )
-        logger.debug("Thread #{} : Received response: {}", thread_index, response.text)
+        logger.debug(
+            "Thread #{} - {}: Received response: {}", thread_index, name, response.text
+        )
 
         self.waiting_thread_index = -1
 
@@ -124,7 +147,9 @@ class PlaceClient:
                 response.json()["errors"][0]["extensions"]["nextAvailablePixelTs"]
             )
             logger.error(
-                "Thread #{} : Failed placing pixel: rate limited", thread_index
+                "Thread #{} - {}: Failed placing pixel: rate limited",
+                thread_index,
+                name,
             )
         else:
             waitTime = math.floor(
@@ -132,7 +157,9 @@ class PlaceClient:
                     "nextAvailablePixelTimestamp"
                 ]
             )
-            logger.info("Thread #{} : Succeeded placing pixel", thread_index)
+            logger.success(
+                "Thread #{} - {}: Succeeded placing pixel", thread_index, name
+            )
 
         # THIS COMMENTED CODE LETS YOU DEBUG THREADS FOR TESTING
         # Works perfect with one thread.
@@ -166,7 +193,11 @@ class PlaceClient:
             )
         )
         while True:
-            msg = ws.recv()
+            try:
+                msg = ws.recv()
+            except WebSocketConnectionClosedException as e:
+                logger.error(e)
+                continue
             if msg is None:
                 logger.error("Reddit failed to acknowledge connection_init")
                 exit()
@@ -260,7 +291,9 @@ class PlaceClient:
                                         requests.get(
                                             msg["data"]["name"],
                                             stream=True,
-                                            proxies=proxy.get_random_proxy(),
+                                            proxies=proxy.get_random_proxy(
+                                                self, name=None
+                                            ),
                                         ).content
                                     )
                                 ),
@@ -306,6 +339,7 @@ class PlaceClient:
         wasWaiting = False
 
         while True:
+            time.sleep(0.05)
             if self.waiting_thread_index != -1 and self.waiting_thread_index != index:
                 x = originalX
                 y = originalY
@@ -348,17 +382,20 @@ class PlaceClient:
 
             target_rgb = self.pix[x, y]
 
-            new_rgb = ColorMapper.closest_color(target_rgb, self.rgb_colors_array)
+            new_rgb = ColorMapper.closest_color(
+                target_rgb, self.rgb_colors_array, self.legacy_transparency
+            )
             if pix2[x + self.pixel_x_start, y + self.pixel_y_start] != new_rgb:
                 logger.debug(
                     "{}, {}, {}, {}",
                     pix2[x + self.pixel_x_start, y + self.pixel_y_start],
                     new_rgb,
-                    target_rgb[:3] != (69, 42, 0) and new_rgb != (69, 42, 0),
+                    new_rgb != (69, 42, 0),
                     pix2[x, y] != new_rgb,
                 )
 
-                if target_rgb[:3] != (69, 42, 0) and new_rgb != (69, 42, 0):
+                # (69, 42, 0) is a special color reserved for transparency.
+                if new_rgb != (69, 42, 0):
                     logger.debug(
                         "Thread #{} : Replacing {} pixel at: {},{} with {} color",
                         index,
@@ -382,7 +419,6 @@ class PlaceClient:
     def task(self, index, name, worker):
         # Whether image should keep drawing itself
         repeat_forever = True
-
         while True:
             # last_time_placed_pixel = math.floor(time.time())
 
@@ -418,7 +454,9 @@ class PlaceClient:
                 time_until_next_draw = next_pixel_placement_time - current_timestamp
 
                 if time_until_next_draw > 10000:
-                    logger.warning(f"Thread #{index} :: CANCELLED :: Rate-Limit Banned")
+                    logger.warning(
+                        "Thread #{} - {} :: CANCELLED :: Rate-Limit Banned", index, name
+                    )
                     repeat_forever = False
                     break
 
@@ -433,7 +471,7 @@ class PlaceClient:
 
                 if len(update_str) > 0:
                     if not self.compactlogging:
-                        logger.info("Thread #{} :: {}", index, update_str)
+                        logger.info("Thread #{} - {}: {}", index, name, update_str)
 
                 # refresh access token if necessary
                 if (
@@ -449,7 +487,9 @@ class PlaceClient:
                     )
                 ):
                     if not self.compactlogging:
-                        logger.info("Thread #{} :: Refreshing access token", index)
+                        logger.info(
+                            "Thread #{} - {}: Refreshing access token", index, name
+                        )
 
                     # developer's reddit username and password
                     try:
@@ -465,12 +505,17 @@ class PlaceClient:
                     while True:
                         try:
                             client = requests.Session()
+                            client.proxies = proxy.get_random_proxy(self, name)
                             client.headers.update(
                                 {
                                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36"
                                 }
                             )
-                            r = client.get("https://www.reddit.com/login")
+
+                            r = client.get(
+                                "https://www.reddit.com/login",
+                                proxies=proxy.get_random_proxy(self, name),
+                            )
                             login_get_soup = BeautifulSoup(r.content, "html.parser")
                             csrf_token = login_get_soup.find(
                                 "input", {"name": "csrf_token"}
@@ -485,7 +530,7 @@ class PlaceClient:
                             r = client.post(
                                 "https://www.reddit.com/login",
                                 data=data,
-                                proxies=proxy.get_random_proxy(),
+                                proxies=proxy.get_random_proxy(self, name),
                             )
                             break
                         except Exception:
@@ -496,13 +541,16 @@ class PlaceClient:
 
                     if r.status_code != HTTPStatus.OK.value:
                         # password is probably invalid
-                        logger.exception("Authorization failed!")
+                        logger.exception("{} - Authorization failed!", username)
                         logger.debug("response: {} - {}", r.status_code, r.text)
                         return
                     else:
-                        logger.success("Authorization successful!")
+                        logger.success("{} - Authorization successful!", username)
                     logger.info("Obtaining access token...")
-                    r = client.get("https://new.reddit.com/")
+                    r = client.get(
+                        "https://new.reddit.com/",
+                        proxies=proxy.get_random_proxy(self, name),
+                    )
                     data_str = (
                         BeautifulSoup(r.content, features="html.parser")
                         .find("script", {"id": "data"})
@@ -578,6 +626,7 @@ class PlaceClient:
                         self.access_tokens[index],
                         pixel_x_start,
                         pixel_y_start,
+                        name,
                         pixel_color_index,
                         canvas,
                         index,
